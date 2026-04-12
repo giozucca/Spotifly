@@ -57,7 +57,7 @@ struct SearchResultsView: View {
                 Spacer()
 
                 if searchResults.tracks.count > 5 {
-                    NavigationLink(value: NavigationDestination.searchTracks(tracks: searchResults.tracks)) {
+                    NavigationLink(value: NavigationDestination.searchTracks(ids: searchResults.tracks.map(\.id))) {
                         HStack(spacing: 4) {
                             Text(String(format: String(localized: "show_all.tracks"), searchResults.tracks.count))
                                 .font(.subheadline)
@@ -93,7 +93,7 @@ struct SearchResultsView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
                     ForEach(searchResults.artists) { artist in
-                        ArtistCard(artist: artist, currentSection: .searchResults)
+                        ArtistCard(artist: artist)
                     }
                 }
                 .padding(.horizontal)
@@ -112,7 +112,7 @@ struct SearchResultsView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
                     ForEach(searchResults.albums) { album in
-                        AlbumCard(album: album, currentSection: .searchResults)
+                        AlbumCard(album: album)
                     }
                 }
                 .padding(.horizontal)

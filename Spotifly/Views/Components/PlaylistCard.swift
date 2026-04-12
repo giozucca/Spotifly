@@ -17,7 +17,7 @@ struct PlaylistCard: View {
 
     var body: some View {
         Button {
-            navigationCoordinator.navigateToPlaylistDetail(playlistId: id)
+            navigationCoordinator.navigateToPlaylistSection(playlistId: id)
         } label: {
             VStack(spacing: 8) {
                 if let url = images.url(for: 120, scale: displayScale) {

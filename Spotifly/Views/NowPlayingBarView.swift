@@ -102,7 +102,7 @@ struct NowPlayingBarView: View {
                             if let artistId = currentTrack?.artistId {
                                 Button {
                                     showAlbumArtMenu = false
-                                    navigationCoordinator.navigateToArtist(artistId: artistId)
+                                    navigationCoordinator.navigateToArtistSection(artistId: artistId)
                                 } label: {
                                     Label("track.menu.go_to_artist", systemImage: "person.circle")
                                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -115,7 +115,7 @@ struct NowPlayingBarView: View {
                             if let albumId = currentTrack?.albumId {
                                 Button {
                                     showAlbumArtMenu = false
-                                    navigationCoordinator.navigateToAlbum(albumId: albumId)
+                                    navigationCoordinator.navigateToAlbumSection(albumId: albumId)
                                 } label: {
                                     Label("track.menu.go_to_album", systemImage: "square.stack")
                                         .frame(maxWidth: .infinity, alignment: .leading)

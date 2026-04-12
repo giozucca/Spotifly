@@ -189,13 +189,11 @@ struct QueueListView: View {
     private func navigateToContext(type: ContextType, id: String) {
         switch type {
         case .album:
-            navigationCoordinator.navigateToAlbumSection(albumId: id, from: .queue)
+            navigationCoordinator.navigateToAlbumSection(albumId: id)
         case .playlist:
-            if let playlist = store.playlists[id] {
-                navigationCoordinator.navigateToPlaylist(playlist)
-            }
+            navigationCoordinator.navigateToPlaylistSection(playlistId: id)
         case .artist:
-            navigationCoordinator.navigateToArtistSection(artistId: id, from: .queue)
+            navigationCoordinator.navigateToArtistSection(artistId: id)
         }
     }
 

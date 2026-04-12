@@ -5,11 +5,7 @@
 //  Created by Ralph von der Heyden on 30.12.25.
 //
 
-import AppKit
-import Combine
 import SwiftUI
-
-// MARK: - LoggedInView
 
 struct LoggedInView: View {
     let authResult: SpotifyAuthResult
@@ -20,18 +16,19 @@ struct LoggedInView: View {
     @State private var session: SpotifySession
     private let playbackViewModel = PlaybackViewModel.shared
 
-    /// Normalized state store
+    /// Normalized state store.
     @State private var store: AppStore
 
-    // Services that need Task deduplication or subscription persistence
+    // Services that need Task deduplication or subscription persistence.
     @State private var playlistService: PlaylistService
     @State private var albumService: AlbumService
     @State private var artistService: ArtistService
     @State private var queueService: QueueService
     @State private var connectionService: ConnectionService
     @State private var deviceService: DeviceService
+    @State private var navigationCoordinator: NavigationCoordinator
 
-    /// Services - stateless, created on demand (all state lives in AppStore)
+    /// Services whose state lives entirely in AppStore.
     private var trackService: TrackService {
         TrackService(store: store)
     }
@@ -48,18 +45,15 @@ struct LoggedInView: View {
         TopItemsService(store: store)
     }
 
-    @State private var navigationCoordinator = NavigationCoordinator()
-
     init(authResult: SpotifyAuthResult, onLogout: @escaping () -> Void) {
         self.authResult = authResult
         self.onLogout = onLogout
 
         let store = AppStore()
         let session = SpotifySession(authResult: authResult)
+
         _store = State(initialValue: store)
         _session = State(initialValue: session)
-
-        // Initialize services that need Task deduplication or subscription persistence
         _playlistService = State(initialValue: PlaylistService(store: store))
         _albumService = State(initialValue: AlbumService(store: store))
         _artistService = State(initialValue: ArtistService(store: store))
@@ -68,8 +62,8 @@ struct LoggedInView: View {
         }))
         _connectionService = State(initialValue: ConnectionService(store: store))
         _deviceService = State(initialValue: DeviceService(store: store))
+        _navigationCoordinator = State(initialValue: NavigationCoordinator(store: store))
 
-        // Give PlaybackViewModel access to AppStore for reading current track metadata
         playbackViewModel.setStore(store)
     }
 
@@ -77,16 +71,9 @@ struct LoggedInView: View {
 
     @AppStorage("topItemsTimeRange") private var topItemsTimeRange: String = TopItemsTimeRange.mediumTerm.rawValue
 
-    @State private var selectedNavigationItem: NavigationItem? = .startpage
     @State private var searchText = ""
     @State private var searchFieldFocused = false
 
-    // Selection state for library detail views (ID-based)
-    @State private var selectedAlbumId: String?
-    @State private var selectedArtistId: String?
-    @State private var selectedPlaylistId: String?
-
-    /// Blocking state shown instead of the main app
     enum BlockingState {
         case premiumRequired
         case userNotWhitelisted
@@ -94,20 +81,14 @@ struct LoggedInView: View {
 
     @State private var blockingState: BlockingState?
 
-    // Sidebar width for dynamic now playing bar positioning
     @State private var sidebarWidth: CGFloat = 0
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @State private var reconnectWatchdogTask: Task<Void, Never>?
 
-    /// Determines if we need three-column layout
-    private var needsThreeColumnLayout: Bool {
-        switch selectedNavigationItem {
-        case .albums, .artists, .playlists:
-            // Always use three-column for library sections (first item is auto-selected)
-            true
-        default:
-            false
-        }
+    private var navigationSelectionBinding: Binding<NavigationItem?> {
+        Binding(
+            get: { navigationCoordinator.selectedNavigationItem },
+            set: { navigationCoordinator.selectNavigationItem($0) },
+        )
     }
 
     var body: some View {
@@ -118,12 +99,14 @@ struct LoggedInView: View {
                 onLogout: onLogout,
             )
             .frame(minWidth: 500, minHeight: 400)
+
         case .userNotWhitelisted:
             UserNotWhitelistedView(
                 clientId: SpotifyConfig.getClientId(),
                 onLogout: onLogout,
             )
             .frame(minWidth: 500, minHeight: 400)
+
         case nil:
             mainAppView
         }
@@ -135,16 +118,16 @@ struct LoggedInView: View {
                 mainLayoutView
             }
 
-            // Now Playing Bar - floats over content, dynamically positioned to clear sidebar
             NowPlayingBarView(
                 playbackViewModel: playbackViewModel,
                 windowState: windowState,
             )
-            .padding(.leading, windowState.isMiniPlayerMode ? 0 : (columnVisibility == .detailOnly ? 0 : sidebarWidth + 8))
+            .padding(.leading, windowState.isMiniPlayerMode ? 0 : nowPlayingLeadingPadding)
         }
         .background(windowState.isMiniPlayerMode ? Color(NSColor.windowBackgroundColor) : Color.clear)
         .searchShortcuts(searchFieldFocused: $searchFieldFocused)
         .environment(session)
+        .environment(connectionService)
         .environment(deviceService)
         .environment(queueService)
         .environment(recentlyPlayedService)
@@ -156,176 +139,83 @@ struct LoggedInView: View {
         .environment(playlistService)
         .environment(albumService)
         .environment(artistService)
-        .focusedValue(\.navigationSelection, $selectedNavigationItem)
+        .focusedValue(\.navigationSelection, navigationSelectionBinding)
         .focusedValue(\.searchFieldFocused, $searchFieldFocused)
         .focusedValue(\.session, session)
         .focusedValue(\.recentlyPlayedService, recentlyPlayedService)
-        .task {
-            #if DEBUG
-                // Set debug references to actual @State stored instances
-                AppStore.current = store
-                SpotifySession.current = session
-            #endif
-
-            // Load startup data
-            let token = await session.validAccessToken()
-
-            // Load user profile (provides userId + whitelist check)
-            do {
-                let profile = try await SpotifyAPI.getCurrentUserProfile(accessToken: token)
-                store.setUserProfile(profile)
-            } catch SpotifyAPIError.forbidden {
-                blockingState = .userNotWhitelisted
-                return
-            } catch {
-                // Profile load failed for other reasons - continue without profile
-            }
-
-            // Require Spotify Premium (librespot only works with Premium accounts).
-            // The product field was removed from /me, so we probe a premium-only endpoint.
-            do {
-                _ = try await SpotifyAPI.fetchAvailableDevices(accessToken: token)
-            } catch SpotifyAPIError.forbidden {
-                blockingState = .premiumRequired
-                return
-            } catch {
-                // Network/other errors - don't block startup, playback will fail later if not premium
-            }
-
-            // Load startpage data (top artists, top tracks, recently played)
-            let timeRange = TopItemsTimeRange(rawValue: topItemsTimeRange) ?? .mediumTerm
-            async let topArtists: () = topItemsService.loadTopArtists(accessToken: token, timeRange: timeRange)
-            async let topTracks: () = topItemsService.loadTopTracks(accessToken: token, timeRange: timeRange)
-            async let recentlyPlayed: () = recentlyPlayedService.loadRecentlyPlayed(accessToken: token)
-
-            _ = await (topArtists, topTracks, recentlyPlayed)
-
-            // Set token provider for automatic reconnection
-            playbackViewModel.setTokenProvider { await session.validAccessToken() }
-            SpotifyPlayer.setTokenProvider(session)
-
-            // Initialize player/Spirc so Spotifly appears as a Connect device
-            await playbackViewModel.initializeIfNeeded(accessToken: token)
-
-            // Fetch initial playback state from Web API (Mercury only receives push updates,
-            // so we need this to sync with whatever device is currently playing)
-            await queueService.fetchInitialPlaybackState(accessToken: token)
+        .loggedInLifecycle(
+            session: session,
+            store: store,
+            topItemsTimeRange: topItemsTimeRange,
+            reconnectWatchdogTimeoutSeconds: reconnectWatchdogTimeoutSeconds,
+            playbackViewModel: playbackViewModel,
+            queueService: queueService,
+            deviceService: deviceService,
+            recentlyPlayedService: recentlyPlayedService,
+            topItemsService: topItemsService,
+            blockingState: $blockingState,
+        )
+        .onChange(of: navigationCoordinator.pendingSectionNavigation) { _, newValue in
+            guard let request = newValue else { return }
+            navigationCoordinator.applySectionNavigationRequest(request)
+            navigationCoordinator.pendingSectionNavigation = nil
         }
-        .onReceive(SpotifyPlayer.sessionConnected) {
-            // Cancel watchdog — session recovered on its own (or via reinit).
-            reconnectWatchdogTask?.cancel()
-            reconnectWatchdogTask = nil
-            // Refresh playback state after session reconnects.
-            // After a transfer the Web API returns stale data for a few seconds,
-            // so we delay the fetch to let the server catch up.
-            // Device active state is now updated via the cluster callback, no HTTP needed here.
+        .onChange(of: navigationCoordinator.currentNavigationSnapshot) { oldValue, newValue in
+            navigationCoordinator.recordNavigationChange(from: oldValue, to: newValue)
+        }
+        .onChange(of: navigationCoordinator.selectedNavigationItem) { _, newValue in
+            guard newValue == .favorites else { return }
             Task {
-                let token = await session.validAccessToken()
-                await deviceService.waitForTransferSettling()
-                await queueService.fetchInitialPlaybackState(accessToken: token)
-            }
-        }
-        .onReceive(SpotifyPlayer.sessionDisconnected) {
-            // Cancel any prior watchdog and start a fresh one.
-            // If isSessionConnected is still false after the timeout, the Rust loop has stalled
-            // (authenticated but Spirc not ready) — force a full reinit.
-            reconnectWatchdogTask?.cancel()
-            reconnectWatchdogTask = Task {
-                // try? is load-bearing: Task.sleep throws CancellationError when cancelled,
-                // which would skip the guard below. try? silences it so the guard runs
-                // and cleanly returns via !Task.isCancelled.
-                try? await Task.sleep(for: .seconds(reconnectWatchdogTimeoutSeconds))
-                guard !Task.isCancelled, !SpotifyPlayer.isSessionConnected else { return }
-                debugLog("LoggedInView", "Watchdog: still disconnected after \(Int(reconnectWatchdogTimeoutSeconds))s, forcing reinit")
-                let token = await session.validAccessToken()
-                await playbackViewModel.forceReinitialize(accessToken: token)
-            }
-        }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)) { _ in
-            // Disconnect from Spotify Connect before sleep so the device disappears immediately.
-            // This is better than pause because a paused device still appears "active" in Spotify
-            // but can't respond to commands while the Mac is asleep. Spotify remembers playback
-            // position server-side, so clicking play after wake resumes where we left off.
-            // disconnect() internally pauses playback and clears the audio buffer synchronously.
-            debugLog("LoggedInView", "System will sleep, disconnecting from Spotify")
-            SpotifyPlayer.disconnect()
-        }
-        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
-            // After system wake, the TCP connection to Spotify servers is dead.
-            // forceReconnect() (the Rust reconnect loop) can get stuck: it may authenticate
-            // successfully but fail to bring Spirc up, leaving the app permanently broken.
-            // forceReinitialize does a full Rust teardown + reinit which is reliably clean.
-            debugLog("LoggedInView", "System wake detected, forcing full reinit")
-            Task {
-                let token = await session.validAccessToken()
-                await playbackViewModel.forceReinitialize(accessToken: token)
-            }
-        }
-        .onChange(of: navigationCoordinator.pendingNavigationItem) { _, newValue in
-            if let pendingItem = newValue {
-                selectedNavigationItem = pendingItem
-                navigationCoordinator.pendingNavigationItem = nil
-            }
-        }
-        .onChange(of: navigationCoordinator.pendingPlaylist) { _, newValue in
-            if newValue != nil {
-                // Clear other selections and navigate to playlists
-                selectedAlbumId = nil
-                selectedArtistId = nil
-                selectedPlaylistId = nil
-                selectedNavigationItem = .playlists
-            }
-        }
-        .onChange(of: selectedNavigationItem) { oldValue, newValue in
-            // Clear navigation stack when switching sidebar sections
-            navigationCoordinator.clearNavigationStack()
-
-            // Clear pending playlist when navigating away from playlists
-            if oldValue == .playlists, newValue != .playlists {
-                navigationCoordinator.pendingPlaylist = nil
-            }
-
-            // Clear ephemeral viewing state when navigating away from albums/artists
-            if oldValue == .albums, newValue != .albums {
-                navigationCoordinator.viewingAlbumId = nil
-            }
-            if oldValue == .artists, newValue != .artists {
-                navigationCoordinator.viewingArtistId = nil
-            }
-        }
-        .onChange(of: selectedPlaylistId) { _, newValue in
-            // Clear pending playlist when user selects a playlist from the list
-            if newValue != nil {
-                navigationCoordinator.pendingPlaylist = nil
+                await ensureFavoritesLoadedForSelection()
             }
         }
     }
 
-    // MARK: - View Builders
+    private var nowPlayingLeadingPadding: CGFloat {
+        columnVisibility == .detailOnly ? 0 : sidebarWidth + 8
+    }
 
     private var mainLayoutView: some View {
         Group {
-            if needsThreeColumnLayout {
+            if navigationCoordinator.needsThreeColumnLayout {
                 NavigationSplitView(columnVisibility: $columnVisibility) {
                     sidebarView()
                 } content: {
-                    contentView()
-                        .navigationSplitViewColumnWidth(min: 300, ideal: 450, max: 600)
+                    LoggedInContentRouterView(
+                        playbackViewModel: playbackViewModel,
+                        onLogout: handleLogout,
+                    )
+                    .navigationSplitViewColumnWidth(min: 300, ideal: 450, max: 600)
+                    .toolbar {
+                        LoggedInContentToolbar(refreshAction: refreshCurrentSection)
+                    }
                 } detail: {
-                    detailView()
+                    LoggedInDetailRouterView(playbackViewModel: playbackViewModel)
+                        .toolbar {
+                            LoggedInDetailToolbar(playbackViewModel: playbackViewModel)
+                        }
+                        .searchable(text: $searchText, isPresented: $searchFieldFocused)
+                        .onSubmit(of: .search) { performSearch() }
+                        .onChange(of: searchText) { _, newValue in handleSearchTextChange(newValue) }
                 }
             } else {
                 NavigationSplitView(columnVisibility: $columnVisibility) {
                     sidebarView()
                 } detail: {
-                    contentView()
+                    LoggedInContentRouterView(
+                        playbackViewModel: playbackViewModel,
+                        onLogout: handleLogout,
+                    )
+                    .toolbar {
+                        LoggedInContentToolbar(refreshAction: refreshCurrentSection)
+                    }
+                    .searchable(text: $searchText, isPresented: $searchFieldFocused)
+                    .onSubmit(of: .search) { performSearch() }
+                    .onChange(of: searchText) { _, newValue in handleSearchTextChange(newValue) }
                 }
             }
         }
         .navigationSplitViewStyle(.automatic)
-        .searchable(text: $searchText, isPresented: $searchFieldFocused)
-        .onSubmit(of: .search) { performSearch() }
-        .onChange(of: searchText) { _, newValue in handleSearchTextChange(newValue) }
         .onChange(of: store.activeDeviceId) { _, newId in
             if newId == nil || newId == store.ownDeviceId {
                 playbackViewModel.becameLocalActiveDevice()
@@ -337,275 +227,12 @@ struct LoggedInView: View {
             guard let newPercent, store.activeDeviceId != store.ownDeviceId else { return }
             playbackViewModel.remoteDeviceVolumeUpdated(newPercent)
         }
-        .toolbar { refreshToolbarItem }
-    }
-
-    @ToolbarContentBuilder
-    private var refreshToolbarItem: some ToolbarContent {
-        ToolbarItem(placement: .navigation) {
-            if canRefreshCurrentSection {
-                Button {
-                    Task { await refreshCurrentSection() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .help("menu.refresh")
-            }
-        }
-        ToolbarItem(placement: .navigation) {
-            if selectedNavigationItem == .queue {
-                Button {
-                    NotificationCenter.default.post(name: .scrollToCurrentTrack, object: nil)
-                } label: {
-                    Image(systemName: "arrow.down.to.line")
-                }
-                .help("queue.scroll_to_current")
-            }
-        }
-        ToolbarItem(placement: .navigation) {
-            contextMenu
-        }
-    }
-
-    // MARK: - Context Menu
-
-    @ViewBuilder
-    private var contextMenu: some View {
-        switch selectedNavigationItem {
-        case .albums:
-            if let albumId = selectedAlbumId, let album = store.albums[albumId] {
-                albumContextMenu(album: album)
-            }
-        case .artists:
-            if let artistId = selectedArtistId, let artist = store.artists[artistId] {
-                artistContextMenu(artist: artist)
-            }
-        case .playlists:
-            if let playlistId = selectedPlaylistId, let playlist = store.playlists[playlistId] {
-                playlistContextMenu(playlist: playlist)
-            }
-        default:
-            EmptyView()
-        }
-    }
-
-    private func albumContextMenu(album: Album) -> some View {
-        let isInLibrary = store.userAlbumIds.contains(album.id)
-
-        return Menu {
-            Button {
-                Task {
-                    let token = await session.validAccessToken()
-                    await playbackViewModel.addToQueue(uri: album.uri, accessToken: token)
-                }
-            } label: {
-                Label("track.menu.play_next", systemImage: "text.line.first.and.arrowtriangle.forward")
-            }
-
-            Divider()
-
-            Button {
-                if let externalUrl = album.externalUrl {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(externalUrl, forType: .string)
-                }
-            } label: {
-                Label("action.share", systemImage: "square.and.arrow.up")
-            }
-            .disabled(album.externalUrl == nil)
-
-            if let artistId = album.artistId {
-                Button {
-                    navigationCoordinator.push(.artist(id: artistId))
-                } label: {
-                    Label("track.menu.go_to_artist", systemImage: "person")
-                }
-            }
-
-            Divider()
-
-            if isInLibrary {
-                Button(role: .destructive) {
-                    NotificationCenter.default.post(name: .showAlbumRemoveConfirmation, object: album.id)
-                } label: {
-                    Label("album.menu.remove_from_library", systemImage: "minus.circle")
-                }
-            } else {
-                Button {
-                    Task {
-                        let token = await session.validAccessToken()
-                        try? await albumService.saveAlbumToLibrary(albumId: album.id, accessToken: token)
-                    }
-                } label: {
-                    Label("album.menu.add_to_library", systemImage: "plus.circle")
-                }
-            }
-        } label: {
-            Image(systemName: "ellipsis")
-        }
-        .menuIndicator(.hidden)
-    }
-
-    private func artistContextMenu(artist: Artist) -> some View {
-        let isFollowing = store.userArtistIds.contains(artist.id)
-
-        return Menu {
-            Button {
-                if let externalUrl = artist.externalUrl {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(externalUrl, forType: .string)
-                }
-            } label: {
-                Label("action.share", systemImage: "square.and.arrow.up")
-            }
-            .disabled(artist.externalUrl == nil)
-
-            Divider()
-
-            if isFollowing {
-                Button(role: .destructive) {
-                    NotificationCenter.default.post(name: .showArtistUnfollowConfirmation, object: artist.id)
-                } label: {
-                    Label("artist.menu.unfollow", systemImage: "person.badge.minus")
-                }
-            } else {
-                Button {
-                    Task {
-                        let token = await session.validAccessToken()
-                        try? await artistService.followArtist(artistId: artist.id, accessToken: token)
-                    }
-                } label: {
-                    Label("artist.menu.follow", systemImage: "person.badge.plus")
-                }
-            }
-        } label: {
-            Image(systemName: "ellipsis")
-        }
-        .menuIndicator(.hidden)
-    }
-
-    private func playlistContextMenu(playlist: Playlist) -> some View {
-        let isOwner = playlist.ownerId == store.userId
-        let isInLibrary = store.userPlaylistIds.contains(playlist.id)
-
-        return Menu {
-            Button {
-                Task {
-                    let token = await session.validAccessToken()
-                    await playbackViewModel.addToQueue(uri: playlist.uri, accessToken: token)
-                }
-            } label: {
-                Label("track.menu.play_next", systemImage: "text.line.first.and.arrowtriangle.forward")
-            }
-
-            Divider()
-
-            Button {
-                if let externalUrl = playlist.externalUrl {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(externalUrl, forType: .string)
-                }
-            } label: {
-                Label("action.share", systemImage: "square.and.arrow.up")
-            }
-            .disabled(playlist.externalUrl == nil)
-
-            if isOwner {
-                Divider()
-
-                Button {
-                    NotificationCenter.default.post(name: .showPlaylistEditDetails, object: playlist.id)
-                } label: {
-                    Label("playlist.menu.edit_details", systemImage: "pencil")
-                }
-
-                Divider()
-
-                Button(role: .destructive) {
-                    NotificationCenter.default.post(name: .showPlaylistDeleteConfirmation, object: playlist.id)
-                } label: {
-                    Label("playlist.menu.delete", systemImage: "trash")
-                }
-            } else {
-                Divider()
-
-                if isInLibrary {
-                    Button(role: .destructive) {
-                        NotificationCenter.default.post(name: .showPlaylistUnfollowConfirmation, object: playlist.id)
-                    } label: {
-                        Label("playlist.menu.unfollow", systemImage: "minus.circle")
-                    }
-                } else {
-                    Button {
-                        Task {
-                            let token = await session.validAccessToken()
-                            try? await playlistService.followPlaylist(playlistId: playlist.id, accessToken: token)
-                        }
-                    } label: {
-                        Label("playlist.menu.follow", systemImage: "plus.circle")
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "ellipsis")
-        }
-        .menuIndicator(.hidden)
-    }
-
-    private func performSearch() {
-        Task {
-            let token = await session.validAccessToken()
-            debugLog("Search", "Starting search for: \(searchText)")
-            await searchService.search(accessToken: token, query: searchText)
-            debugLog("Search", "After search - results: \(store.searchResults != nil), error: \(store.searchErrorMessage ?? "nil")")
-            if store.searchResults != nil {
-                selectedNavigationItem = .searchResults
-            }
-        }
-    }
-
-    private func handleSearchTextChange(_ newValue: String) {
-        if newValue.isEmpty {
-            store.clearSearch()
-            if selectedNavigationItem == .searchResults {
-                selectedNavigationItem = .startpage
-            }
-        }
-    }
-
-    /// Handle back navigation from AlbumsListView/ArtistsListView
-    private func handleBackNavigation(section: NavigationItem, selectionId: String?) {
-        // Clear ephemeral viewing state
-        navigationCoordinator.clearEphemeralViewing()
-
-        // Navigate to the previous section
-        selectedNavigationItem = section
-
-        // Restore selection if provided
-        if let selectionId {
-            switch section {
-            case .playlists:
-                selectedPlaylistId = selectionId
-            case .albums:
-                selectedAlbumId = selectionId
-            case .artists:
-                selectedArtistId = selectionId
-            default:
-                break
-            }
-        }
     }
 
     private func sidebarView() -> some View {
         SidebarView(
-            selection: $selectedNavigationItem,
-            onLogout: {
-                playbackViewModel.stop()
-                onLogout()
-            },
+            selection: navigationSelectionBinding,
+            onLogout: handleLogout,
             hasSearchResults: store.searchResults != nil,
             userProfile: store.userProfile,
         )
@@ -613,7 +240,6 @@ struct LoggedInView: View {
             GeometryReader { geometry in
                 Color.clear
                     .task(id: geometry.size.width) {
-                        // Only log and update if width actually changed (not just view recreation)
                         guard sidebarWidth != geometry.size.width else { return }
                         debugLog("SidebarWidth", "Updating sidebarWidth to: \(geometry.size.width)")
                         await MainActor.run {
@@ -624,41 +250,67 @@ struct LoggedInView: View {
         }
     }
 
-    /// Whether the current section supports refresh
-    private var canRefreshCurrentSection: Bool {
-        switch selectedNavigationItem {
-        case .playlists, .albums, .artists, .favorites, .speakers, .queue:
-            true
-        default:
-            false
+    private func handleLogout() {
+        playbackViewModel.stop()
+        onLogout()
+    }
+
+    private func performSearch() {
+        Task {
+            let token = await session.validAccessToken()
+            debugLog("Search", "Starting search for: \(searchText)")
+            await searchService.search(accessToken: token, query: searchText)
+            debugLog("Search", "After search - results: \(store.searchResults != nil), error: \(store.searchErrorMessage ?? "nil")")
+            if store.searchResults != nil {
+                navigationCoordinator.selectNavigationItem(.searchResults)
+            }
         }
     }
 
-    /// Refresh data for the current section (clears store and fetches fresh)
+    private func handleSearchTextChange(_ newValue: String) {
+        guard newValue.isEmpty else { return }
+
+        store.clearSearch()
+        navigationCoordinator.pruneSearchHistory()
+
+        if navigationCoordinator.selectedNavigationItem == .searchResults {
+            navigationCoordinator.selectNavigationItem(.startpage)
+        }
+    }
+
     private func refreshCurrentSection() async {
         let token = await session.validAccessToken()
 
-        switch selectedNavigationItem {
+        switch navigationCoordinator.selectedNavigationItem {
         case .playlists:
-            let previousSelection = selectedPlaylistId
+            let previousSelection = navigationCoordinator.selectedPlaylistId
             store.playlistsPagination.reset()
             store.setUserPlaylistIds([])
             try? await playlistService.loadUserPlaylists(accessToken: token, forceRefresh: true)
-            restoreOrSelectFirst(previous: previousSelection, available: store.userPlaylistIds, selection: &selectedPlaylistId)
+            navigationCoordinator.restorePlaylistSelection(
+                previous: previousSelection,
+                available: store.userPlaylistIds,
+            )
 
         case .albums:
-            let previousSelection = selectedAlbumId
+            let previousSelection = navigationCoordinator.selectedAlbumId
             store.albumsPagination.reset()
             store.setUserAlbumIds([])
             try? await albumService.loadUserAlbums(accessToken: token, forceRefresh: true)
-            restoreOrSelectFirst(previous: previousSelection, available: store.userAlbumIds, selection: &selectedAlbumId)
+            navigationCoordinator.restoreAlbumSelection(
+                previous: previousSelection,
+                available: store.userAlbumIds,
+            )
 
         case .artists:
-            let previousSelection = selectedArtistId
+            let previousSelection = navigationCoordinator.selectedArtistId
             store.artistsPagination.reset()
             store.setUserArtistIds([])
             try? await artistService.loadUserArtists(accessToken: token, forceRefresh: true)
-            restoreOrSelectFirst(previous: previousSelection, available: store.userArtistIds, selection: &selectedArtistId)
+            navigationCoordinator.restoreArtistSelection(
+                previous: previousSelection,
+                available: store.userArtistIds,
+            )
 
         case .favorites:
             store.favoritesPagination.reset()
@@ -673,193 +325,21 @@ struct LoggedInView: View {
         }
     }
 
-    /// Restore previous selection if still available, otherwise select first item
-    private func restoreOrSelectFirst(previous: String?, available: [String], selection: inout String?) {
-        if let previous, available.contains(previous) {
-            selection = previous
-        } else {
-            selection = available.first
-        }
-    }
+    private func ensureFavoritesLoadedForSelection() async {
+        guard navigationCoordinator.selectedNavigationItem == .favorites else { return }
+        guard !store.favoritesPagination.isLoading else { return }
 
-    private func contentView() -> some View {
-        NavigationStack(path: $navigationCoordinator.navigationPath) {
-            Group {
-                if selectedNavigationItem == .searchResults,
-                   let searchResults = store.searchResults
-                {
-                    // Show search results when Search Results is selected
-                    SearchResultsView(searchResults: searchResults, playbackViewModel: playbackViewModel)
-                        .navigationTitle("nav.search_results")
-                } else {
-                    // Show main views for other sections
-                    Group {
-                        switch selectedNavigationItem {
-                        case .startpage:
-                            StartpageView()
-                                .navigationTitle("nav.startpage")
+        let needsInitialLoad = !store.favoritesPagination.isLoaded
+        let needsRecoveryRefresh = store.favoriteTracks.isEmpty && store.favoritesPagination.total > 0
 
-                        case .favorites:
-                            FavoritesListView(
-                                playbackViewModel: playbackViewModel,
-                            )
-                            .navigationTitle("nav.favorites")
+        guard needsInitialLoad || needsRecoveryRefresh else { return }
 
-                        case .playlists:
-                            PlaylistsListView(
-                                playbackViewModel: playbackViewModel,
-                                selectedPlaylistId: $selectedPlaylistId,
-                            )
-                            .navigationTitle("nav.playlists")
+        let token = await session.validAccessToken()
+        guard navigationCoordinator.selectedNavigationItem == .favorites else { return }
 
-                        case .albums:
-                            AlbumsListView(
-                                playbackViewModel: playbackViewModel,
-                                selectedAlbumId: $selectedAlbumId,
-                                onBack: handleBackNavigation,
-                            )
-                            .navigationTitle("nav.albums")
-
-                        case .artists:
-                            ArtistsListView(
-                                playbackViewModel: playbackViewModel,
-                                selectedArtistId: $selectedArtistId,
-                                onBack: handleBackNavigation,
-                            )
-                            .navigationTitle("nav.artists")
-
-                        case .queue:
-                            QueueListView(playbackViewModel: playbackViewModel)
-                                .navigationTitle("nav.queue")
-
-                        case .speakers:
-                            SpeakersView(playbackViewModel: playbackViewModel)
-                                .navigationTitle("nav.speakers")
-
-                        case .profile:
-                            if let profile = store.userProfile {
-                                UserProfileView(userProfile: profile, onLogout: {
-                                    playbackViewModel.stop()
-                                    onLogout()
-                                })
-                            }
-
-                        case .searchResults:
-                            // Handled in outer if statement
-                            EmptyView()
-
-                        case .none:
-                            Text("empty.select_item")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .playbackShortcuts(playbackViewModel: playbackViewModel)
-                    .libraryNavigationShortcuts(selection: $selectedNavigationItem)
-                }
-            }
-            .navigationDestination(for: NavigationDestination.self) { destination in
-                destinationView(for: destination)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func destinationView(for destination: NavigationDestination) -> some View {
-        switch destination {
-        case let .artist(id):
-            ArtistDetailView(
-                artistId: id,
-                playbackViewModel: playbackViewModel,
-            )
-
-        case let .album(id):
-            AlbumDetailView(
-                albumId: id,
-                playbackViewModel: playbackViewModel,
-            )
-
-        case let .playlist(id):
-            PlaylistDetailView(
-                playlistId: id,
-                playbackViewModel: playbackViewModel,
-            )
-
-        case let .searchTracks(tracks):
-            SearchAllTracksView(
-                tracks: tracks,
-                playbackViewModel: playbackViewModel,
-            )
-        }
-    }
-
-    private func detailView() -> some View {
-        Group {
-            // Show details for library selections (three-column layout)
-            switch selectedNavigationItem {
-            case .albums:
-                if let albumId = selectedAlbumId,
-                   let album = store.albums[albumId]
-                {
-                    AlbumDetailView(
-                        album: album,
-                        playbackViewModel: playbackViewModel,
-                    )
-                    .id(albumId) // Force view recreation when album changes
-                } else if let albumId = selectedAlbumId {
-                    // Album ID is set but not in store yet - show loading and fetch
-                    AlbumDetailView(
-                        albumId: albumId,
-                        playbackViewModel: playbackViewModel,
-                    )
-                    .id(albumId)
-                } else {
-                    Text("empty.select_album")
-                        .foregroundStyle(.secondary)
-                }
-
-            case .artists:
-                if let artistId = selectedArtistId,
-                   let artist = store.artists[artistId]
-                {
-                    ArtistDetailView(
-                        artist: artist,
-                        playbackViewModel: playbackViewModel,
-                    )
-                    .id(artistId) // Force view recreation when artist changes
-                } else if let artistId = selectedArtistId {
-                    // Artist ID is set but not in store yet - show loading and fetch
-                    ArtistDetailView(
-                        artistId: artistId,
-                        playbackViewModel: playbackViewModel,
-                    )
-                    .id(artistId)
-                } else {
-                    Text("empty.select_artist")
-                        .foregroundStyle(.secondary)
-                }
-
-            case .playlists:
-                if let pendingPlaylist = navigationCoordinator.pendingPlaylist {
-                    PlaylistDetailView(
-                        playlist: pendingPlaylist,
-                        playbackViewModel: playbackViewModel,
-                    )
-                } else if let playlistId = selectedPlaylistId,
-                          let playlist = store.playlists[playlistId]
-                {
-                    PlaylistDetailView(
-                        playlist: playlist,
-                        playbackViewModel: playbackViewModel,
-                    )
-                } else {
-                    Text("empty.select_playlist")
-                        .foregroundStyle(.secondary)
-                }
-
-            default:
-                // For Favorites, Queue, etc.: no detail view
-                EmptyView()
-            }
-        }
+        try? await trackService.loadFavorites(
+            accessToken: token,
+            forceRefresh: needsRecoveryRefresh,
+        )
     }
 }
